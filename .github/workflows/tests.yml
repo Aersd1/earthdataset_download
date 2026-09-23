@@ -20,5 +20,6 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: python -m pip check
       - run: python -m unittest discover -p 'test_*.py' -v
-      - run: bash -n setup.sh examples/nearest_point.sh examples/region_50km.sh
+      - run: bash -n setup.sh examples/nearest_point.sh examples/region_50km.sh examples/era5_linux.sh
       - run: python download_region.py era5 --point --start 2020-01-01 --end 2020-01-01 --group all --dry-run
+      - run: python download_region.py era5 --nearest --date 2025-02 --dry-run

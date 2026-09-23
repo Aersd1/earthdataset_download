@@ -6,5 +6,7 @@ python_bin="${PYTHON_BIN:-python3}"
 "$python_bin" -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m unittest discover -p 'test_*.py' -v
+if [[ "${RUN_TESTS:-0}" == "1" ]]; then
+  .venv/bin/python -m unittest discover -p 'test_*.py' -v
+fi
 printf '\nReady. Run: .venv/bin/python download_region.py --help\n'

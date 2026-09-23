@@ -12,6 +12,7 @@ manifests/
 *.grib2
 *.zarr/
 .cdsapirc
+.adsapirc
 .ecmwfapirc
 .netrc
 _netrc

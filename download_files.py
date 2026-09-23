@@ -14,6 +14,8 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from accounts import account_notice, explain_api_error
+
 
 def session():
     import requests
@@ -44,6 +46,7 @@ def fetch(url, target, expected_magic=None, checksum=None, checksum_type=None, e
             raise ValueError('Earthdata token may only be used with NASA endpoints.')
         token = os.environ.get('EARTHDATA_TOKEN')
         if not token:
+            account_notice('earthdata', open_browser=True)
             raise ValueError('Set EARTHDATA_TOKEN; authorize NASA GES DISC in Earthdata first.')
         headers['Authorization'] = 'Bearer ' + token
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +88,9 @@ def fetch(url, target, expected_magic=None, checksum=None, checksum_type=None, e
             receipt.write_text(json.dumps(identity, indent=2), encoding='utf-8')
             print(f'Saved {size:,} bytes: {target}')
             return
-        except (requests.RequestException, OSError):
+        except (requests.RequestException, OSError) as exc:
+            if earthdata and explain_api_error(exc, 'earthdata', []):
+                raise ValueError('NASA access denied; see account instructions above.') from None
             if attempt == 2:
                 raise
             time.sleep(2 ** (attempt + 1))

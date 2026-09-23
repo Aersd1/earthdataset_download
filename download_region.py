@@ -6,9 +6,11 @@ import calendar
 import hashlib
 import json
 import math
-import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+from accounts import account_notice, cds_client, explain_api_error
+from date_selection import normalize_dates, resolve_latest, report_range
 
 LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
 SURFACE = ['2m_temperature', '10m_u_component_of_wind',
@@ -132,28 +134,28 @@ def api_download(a):
         print(json.dumps({'target': str(target), **record}, indent=2))
         if a.dry_run:
             continue
+        if target.exists() and target.stat().st_size:
+            print('Already complete:', target)
+            continue
         if client is None:
             if a.source == 'hres-mars':
                 import ecmwfapi
                 client = ecmwfapi.ECMWFService('mars')
             else:
-                import cdsapi
-                service = 'CDS' if a.source == 'era5' else 'ADS'
-                url = ('https://cds.climate.copernicus.eu/api' if service == 'CDS'
-                       else 'https://ads.atmosphere.copernicus.eu/api')
-                key = os.environ.get(service + '_API_KEY')
-                if not key:
-                    raise ValueError(f'Set {service}_API_KEY in your environment; see README_zh.md.')
-                client = cdsapi.Client(url=url, key=key)
+                service = 'cds' if a.source == 'era5' else 'ads'
+                client = cds_client(service, sorted({job[0] for job in jobs}))
         a.out.mkdir(parents=True, exist_ok=True)
-        if target.exists() and target.stat().st_size:
-            print('Already complete:', target)
-            continue
         part = target.with_suffix(target.suffix + '.part')
-        if ds == 'mars':
-            client.execute(req, str(part))
-        else:
-            client.retrieve(ds, req, str(part))
+        try:
+            if ds == 'mars':
+                client.execute(req, str(part))
+            else:
+                client.retrieve(ds, req, str(part))
+        except Exception as exc:
+            service = 'mars' if ds == 'mars' else ('cds' if a.source == 'era5' else 'ads')
+            if explain_api_error(exc, service, [ds]):
+                raise ValueError('Download access denied; account instructions are shown above.') from None
+            raise
         if not part.exists() or part.stat().st_size == 0:
             raise RuntimeError('Empty download; final file not written.')
         part.replace(target)
@@ -236,6 +238,13 @@ def wb_request(a, first, last):
 def wb_download(a):
     import numpy as np
     import xarray as xr
+    if not a.end:
+        url = 'https://storage.googleapis.com/weatherbench2/datasets/' + WB[a.dataset]
+        with xr.open_zarr(url, consolidated=True,
+                          storage_options={'client_kwargs': {'trust_env': True}},
+                          chunks=None, decode_timedelta=True) as source:
+            a.end = str(source.time.values[-1].astype('datetime64[D]'))
+        report_range(a)
     # Public HTTPS exposes the same GCS objects without authentication or gRPC threads.
     for first, last in monthly(a.start, a.end):
         record = wb_request(a, first, last)
@@ -290,7 +299,9 @@ def subset_file(a):
     with xr.open_dataset(a.input, **kwargs) as original:
         ds = original[a.variables] if a.variables else original
         time_name = next((n for n in ['time', 'valid_time'] if n in ds.dims), None)
-        if time_name and a.start:
+        if (a.start or a.end) and not time_name:
+            raise ValueError('Date selection requires a time or valid_time dimension in the input.')
+        if time_name and (a.start or a.end):
             ds = ds.sel({time_name: slice(a.start, a.end)})
             if ds.sizes[time_name] == 0:
                 raise ValueError('Empty time selection.')
@@ -308,7 +319,7 @@ def gfs_download(a):
     first, last = date.fromisoformat(a.start), date.fromisoformat(a.end)
     if last < first:
         raise ValueError('start must be <= end')
-    if (date.today() - first).days > 10:
+    if (datetime.now(timezone.utc).date() - first).days > 10:
         raise ValueError('NOMADS is a rolling recent archive, not the 2015-2020 paper archive. See README.')
     if not a.lead_hours:
         raise ValueError('GFS requires --lead-hours (0 selects forecast initialization).')
@@ -343,14 +354,16 @@ def gfs_download(a):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('source', choices=['era5', 'wb', 'cams-eac4', 'cams-analysis', 'hres-mars', 'gfs', 'subset'])
+    p.add_argument('source', choices=['era5', 'gfs-archive', 'ifs-open', 'wb', 'cams-eac4', 'cams-analysis', 'hres-mars', 'gfs', 'subset'])
     p.add_argument('--lat', type=float, default=36.3)
     p.add_argument('--lon', type=float, default=120.33)
     space = p.add_mutually_exclusive_group()
     space.add_argument('--point', '--nearest', action='store_true', help='Select nearest grid point')
     space.add_argument('--radius-km', type=float, default=50, help='Default 50; APIs return enclosing rectangle')
-    p.add_argument('--start', help='YYYY-MM-DD, inclusive UTC date')
-    p.add_argument('--end', help='YYYY-MM-DD, inclusive UTC date')
+    p.add_argument('--date', help='One whole UTC period: YYYY, YYYY-MM or YYYY-MM-DD')
+    p.add_argument('--start', help='Inclusive UTC start: YYYY, YYYY-MM or YYYY-MM-DD')
+    p.add_argument('--end', help='Inclusive UTC end: YYYY, YYYY-MM or YYYY-MM-DD; omitted = latest available')
+    p.add_argument('--open-registration', action='store_true', help='Show/open account and licence pages, then exit')
     p.add_argument('--hours', nargs='+', type=int, default=[0, 6, 12, 18])
     p.add_argument('--group', choices=['surface', 'pressure', 'static', 'all'], default='surface')
     p.add_argument('--variables', nargs='+')
@@ -362,7 +375,8 @@ def parser():
     p.add_argument('--input', help='Local NetCDF/GRIB or authenticated OPeNDAP URL')
     p.add_argument('--engine', choices=['netcdf4', 'cfgrib'])
     p.add_argument('--out', type=Path, default=Path(__file__).parent / 'downloads')
-    p.add_argument('--csv', action='store_true', help='WB/subset also write CSV (small point data recommended)')
+    p.add_argument('--csv', action='store_true', help='WB/GFS/IFS/subset also write CSV (small point data recommended)')
+    p.add_argument('--keep-grib', action='store_true', help='GFS/IFS: retain selected global GRIB fields after subsetting')
     p.add_argument('--dry-run', action='store_true')
     return p
 
@@ -371,22 +385,38 @@ def main():
     p = parser()
     a = p.parse_args()
     try:
+        if a.open_registration:
+            if a.source == 'era5' or a.source.startswith('cams'):
+                from date_selection import cds_collections
+                account_notice('cds' if a.source == 'era5' else 'ads',
+                               [name for _, name in cds_collections(a)], open_browser=True)
+            elif a.source == 'hres-mars':
+                account_notice('mars', open_browser=True)
+            else:
+                print('This source needs no registration (authenticated input URLs may differ).')
+            return
         region(a.lat, a.lon, 0 if a.point else a.radius_km)
         if any(h < 0 or h > 23 for h in a.hours):
             raise ValueError('--hours must be 0..23')
         if a.lead_hours and any(h < 0 for h in a.lead_hours):
             raise ValueError('Lead times cannot be negative.')
-        if a.source != 'subset' and (not a.start or not a.end):
-            raise ValueError('--start and --end are required; no implicit multi-year downloads.')
-        if a.start and a.end:
-            list(monthly(a.start, a.end))
+        normalize_dates(a)
         if a.source == 'subset' and not a.input:
             raise ValueError('subset requires --input')
         if a.source == 'era5' and a.group == 'all' and a.variables:
             raise ValueError('--variables requires a single --group.')
-        if a.csv and a.source not in ('wb', 'subset'):
-            raise ValueError('--csv applies to wb/subset; download first, then use subset --csv.')
-        {'wb': wb_download, 'subset': subset_file, 'gfs': gfs_download}.get(a.source, api_download)(a)
+        if a.csv and a.source not in ('wb', 'subset', 'gfs-archive', 'ifs-open'):
+            raise ValueError('--csv applies to wb/gfs-archive/ifs-open/subset; download first, then use subset --csv.')
+        resolve_latest(a)
+        report_range(a)
+        if a.source == 'gfs-archive':
+            from gfs_archive import download
+            download(a)
+        elif a.source == 'ifs-open':
+            from ifs_open import download
+            download(a)
+        else:
+            {'wb': wb_download, 'subset': subset_file, 'gfs': gfs_download}.get(a.source, api_download)(a)
     except (ValueError, ImportError) as error:
         p.exit(2, f'Error: {error}\n')
 
