@@ -1,0 +1,12 @@
+cdsapi>=0.7.7
+xarray>=2024.6
+numpy>=1.26
+dask[array]>=2024.6
+zarr>=3.1,<4
+fsspec[http]>=2024.6
+netCDF4>=1.7
+requests>=2.32
+# Only needed for ECMWF historical official analysis:
+# ecmwf-api-client
+# Only needed to open GRIB in the subset command:
+# cfgrib

@@ -1,0 +1,24 @@
+name: Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m pip check
+      - run: python -m unittest discover -p 'test_*.py' -v
+      - run: bash -n setup.sh examples/nearest_point.sh examples/region_50km.sh
+      - run: python download_region.py era5 --point --start 2020-01-01 --end 2020-01-01 --group all --dry-run
